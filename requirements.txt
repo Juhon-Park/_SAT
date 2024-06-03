@@ -1,0 +1,4 @@
+gpustat
+tensorboardX
+wandb
+torchsummary
