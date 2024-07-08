@@ -7,6 +7,7 @@ from . import quantizer
 from quan_ops.acti_quan_ops import *
 from quan_ops.bn_quan_ops import *
 from quan_ops.approx_adder import *
+from quan_ops.approx_compressor import *
 from configs.config import *
 import math
 
@@ -36,9 +37,15 @@ def conv2dQ(wbit_list, abit_list):
             self.wbit_list = wbit_list
             self.wbit = self.wbit_list[-1]
             self.quantize_fn = quantizer.weight_quantize_fn(self.wbit_list)
+            self.count = 0
 
         def forward(self, input, order=None):
             weight_q = self.quantize_fn(self.weight)
+            
+            # self.count = self.count + 1
+            # print("input x: {}, weight: {}, weight_q: {}, count: {}".format(input.shape, self.weight.shape, weight_q.shape, self.count))
+    
+            
             return F.conv2d(input, weight_q, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
     return Conv2d_Q_
@@ -106,9 +113,13 @@ def conv2d_noQ(wbit_list, abit_list):
     return Conv2d_NoQ_
 
 
+
+##added for SAT
+
 class Conv2d_Sparse(nn.Conv2d, nn.Module):
     def __init__(self, *kargs, **kwargs):
         super(Conv2d_Sparse, self).__init__(*kargs, **kwargs)
+
 
 def conv2d_sparse(wbit_list, abit_list):
     class Conv2d_Sparse_(Conv2d_Sparse):
@@ -119,22 +130,29 @@ def conv2d_sparse(wbit_list, abit_list):
             self.kernel_size = (kernel_size,kernel_size)
             self.out_channels = out_channels
             self.padding = (padding, padding)
+            self.stride  = stride
             
-            
-            # Initialize weights 
-            self.weight = nn.Parameter(torch.randint(0,2,(out_channels, in_channels, self.kernel_size[0],
-                                                                self.kernel_size[0])).float().cuda())
+            # Initialize weights >> parameter 2배로 만듬
+            # self.weight = nn.Parameter(torch.randint(0,2,(out_channels, in_channels, self.kernel_size[0],
+            #                                                     self.kernel_size[0])).float().cuda())
+            #xavier_uniform
+            self.weight = nn.Parameter(torch.empty(out_channels, in_channels, self.kernel_size[0], self.kernel_size[0], device='cuda'))
+            torch.nn.init.xavier_uniform_(self.weight)
 
+            
             self.pw_width = 3
             self.pw_height = 3
+            self.count = 0
 
             #flattened weight
+            # Initialize weights with nn.Parameter >> parameter 2배로 만듬
             if self.kernel_size[0] == 3:
-                self.weight_map = torch.nn.Parameter(self._gen_SDK_mapping(self.weight)).cuda()
+                self.weight_map = self._gen_SDK_mapping(self.weight).cuda()
+                # self.weight_map = nn.Parameter(self._gen_SDK_mapping(self.weight)).cuda()
             else:
                 self.weight_map = torch.squeeze(self.weight).cuda()
             
-
+# SDK version
 
         def _ordered_pairs_sum(self, x):
             a = torch.arange(x + 1)
@@ -143,6 +161,7 @@ def conv2d_sparse(wbit_list, abit_list):
             return pairs
 
         def _gen_SDK_mapping(self, my_tensor):
+            print("Befor SDK: {}".format(my_tensor.shape))
             h_diff = self.pw_height - self.kernel_size[0]
             w_diff = self.pw_width - self.kernel_size[0]
 
@@ -159,90 +178,124 @@ def conv2d_sparse(wbit_list, abit_list):
 
                     SDK_mapping.append(flat_kernel)
 
-            SDK_mapping = torch.concat(SDK_mapping)
-
+            SDK_mapping = torch.cat(SDK_mapping)
+            print("After SDK: {}".format(SDK_mapping.shape))
             return SDK_mapping
 
         #partial product
         def _forward(self, x):
+           
 
             weight = self.weight_map.detach().unsqueeze(1)
+            print("WEIGHT SHAPE: {}".format(weight.shape))
             x = x.unsqueeze(1)
+            print("INPUT SHAPE: {}".format(x.shape))
             weight = weight
             x = x
+            
             partial_product = torch.mul(x,weight)
+            print("MUL SHAPE: {}".format(partial_product.shape))
+            # print("mul x: {}, mul w: {}, result: {}".format(x.shape, weight.shape, partial_product.shape))
+    
+            
             return partial_product
-
+        
         #flattened input & AT1, AT2 & sum & reshape
         def _slice_and_forward(self, x):
+            
             num, depth, height, width = x.shape
 
-            stride_ver = self.pw_height - self.kernel_size[0] + 1
-            stride_hor = self.pw_width  - self.kernel_size[0] + 1
+            # self.count = self.count + 1
+            # print("input x: {}, count: {}".format(x.shape, self.count))
 
-            pad_ver = (height + 2 - self.pw_height) % stride_ver
-            pad_hor = (width  + 2 - self.pw_width)  % stride_hor
+            # stride_ver = self.pw_height - self.kernel_size[0] + 1
+            # stride_hor = self.pw_width  - self.kernel_size[0] + 1
+            stride_ver = self.stride
+            stride_hor = self.stride
+
+            pad_ver = (height + 2 - self.kernel_size[0]) % stride_ver
+            pad_hor = (width  + 2 - self.kernel_size[1])  % stride_hor
             
-
-            slide_ver = math.ceil((height + 2 - self.pw_height) / stride_ver) + 1
-            slide_hor = math.ceil((width  + 2 - self.pw_width ) / stride_hor) + 1
-
-            if self.padding[0]:
-                padded_x = F.pad(x, (1, 1 + pad_hor, 1, 1 + pad_ver),mode='constant', value=0)
-                
+            
+            if self.padding[0]: # image /2
+                # padded_x = F.pad(x, (1, 1 + pad_hor, 1, 1 + pad_ver),mode='constant', value=0)
+                padded_x = F.pad(x, (1, 1, 1, 1),mode='constant', value=0)
+                    
             else:
                 padded_x = x
-                stride_ver = 1
-                stride_hor = 1
+                # stride_ver = 1
+                # stride_hor = 1
+            slide_ver = math.floor((padded_x.shape[2] - self.kernel_size[0]) / stride_ver) + 1
+            slide_hor = math.floor((padded_x.shape[3] - self.kernel_size[1] ) / stride_hor) + 1
+            
+        
+            print("------------------ kernel: {}, stride: {}, pad계산: {}, pad기존: {}, slide: {}, padded_x: {}".format(self.kernel_size[0], stride_ver, pad_ver, self.padding[0], slide_ver, padded_x.shape))
 
             flattened_input = F.unfold(padded_x,
                                     kernel_size= self.kernel_size,
                                     stride=(stride_ver, stride_hor)).transpose(1,2).squeeze()
+            
+
             flattened_input = torch.where(flattened_input > 0.0, torch.tensor(1.0, device=flattened_input.device), torch.tensor(0.0, device=flattened_input.device))
-
-
+            
             lin_out = self._forward(flattened_input).detach()
+            
+            print("LIN_OUT: {}".format(lin_out.shape))
             
             weight_size = lin_out.shape[3]
             
-            lin_out = lin_out.reshape((-1,weight_size))
-            lin_out = torch.transpose(lin_out,0,1)
-            lin_out = self._aft_sat(lin_out)                       
+            
+            lin_out = lin_out.reshape((-1, weight_size)).transpose(0, 1)
+            print("LIN_OUT_BEFORE_SAT: {}".format(lin_out.shape))
+            lin_out = self._aft_sat(lin_out)
+            print("LIN_OUT_AFTER_SAT: {}".format(lin_out.shape))
             lin_out = self._aft_sec_sat(lin_out)
+            print("LIN_OUT_AFTER_AFTER_SAT: {}".format(lin_out.shape))
+            # print("before: {}".format(lin_out.shape))
 
-
-            if self.padding[0]:
-                lin_out = lin_out.squeeze(1)
+            # if self.padding[0]:
+            #     lin_out = lin_out.squeeze(1)
+            
+            # print("after: {}".format(lin_out.shape))
             
             lin_out = lin_out[0][0] + lin_out[0][1]*2 +lin_out[1][0]*2 + lin_out[1][1]*4
 
             lin_out = torch.sum(lin_out, dim=0).detach()
+            print("AFTER SUM: {}".format(lin_out.shape))
             lin_out = lin_out.view(1,-1)
             
-            if not self.padding[0]:
-                slide_ver = height - self.kernel_size[0] +1
-                slide_hor = width  - self.kernel_size[0] +1
-
+            # if not self.padding[0]:
+            #     slide_ver = height - self.kernel_size[0] +1
+            #     slide_hor = width  - self.kernel_size[0] +1
+            
+            
 
             lin_out = lin_out.reshape(num, slide_ver, slide_hor,
                                      1, 1, self.out_channels)
-
+            print("1ST RESHAPE: {}".format(lin_out.shape))
+            
             
             lin_out = lin_out.transpose(2,3)
+            print("2ND RESHAPE: {}".format(lin_out.shape))
             lin_out = lin_out.reshape(num,
                                      slide_ver+int(pad_ver/2),
                                      slide_hor+int(pad_hor/2),
                                      self.out_channels)
             lin_out = lin_out.transpose(3,1).transpose(3,2)
+            
+            print("LAST RESHAPE: {}".format(lin_out.shape))
 
             lin_out = lin_out[:,:,:slide_ver,:slide_hor]
+            
+
+            
             return lin_out
         
         #AT1
         def _aft_sat(self, x):
             device = x.device
             size = x.shape[0]
-
+            
             #need to deal with the case when if size%3 == (1 or 2). currently just delete the last row
             if size%3:
                 x = x[:-(size%3), :]
@@ -281,7 +334,16 @@ def conv2d_sparse(wbit_list, abit_list):
             return answer.to(x.device)
 
         def forward(self, input):
+            # self.count += 1
+            
+            # print("input x: {}, weight: {}, SDK_weight: {}, count: {}".format(input.shape, self.weight.shape, self.weight_map.shape, self.count))
+           
+            print("PRIMARY INPUT SHAPE: {}".format(input.shape))
+            print("PRIMARY WEIGHT: {}".format(self.weight.shape))
             return self._slice_and_forward(input.float())
 
     return Conv2d_Sparse_
+
+
+
         
